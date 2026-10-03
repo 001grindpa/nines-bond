@@ -1,68 +1,62 @@
 # Nines Bond
 
-This project contains a GenLayer smart contract for an SLA outage credit policy. The deployed contract is:
+GenLayer SLA outage credit. A customer prepays a month. Two public status pages must agree that an incident hit the named service on `incident_date`.
 
-- Explorer: https://explorer-studio.genlayer.com/address/0x340289bE2e8F218b64A90916f3B0c1918EbafBe9
-- Contract address: 0x340289bE2e8F218b64A90916f3B0c1918EbafBe9
+- Explorer: https://explorer-studio.genlayer.com/address/0x0ce9eF532FF4572c954232FC2b1e2930A2f25847
+- Contract address: 0x0ce9eF532FF4572c954232FC2b1e2930A2f25847
 
-The contract source is in src/Ninesbond.py and the active direct contract tests are in test/direct/test_sla_outage_credit.py.
+Source: `src/Ninesbond.py`. Direct tests: `test/direct/test_sla_outage_credit.py`.
 
 ## What the contract does
 
-The contract lets a customer buy outage protection for a provider-backed service. A policy stores the provider, the service name, billing period, incident date, resolution date, credit amount, and two public status URLs to inspect.
+A customer buys cover against a provider. The policy stores the provider, service, covered period, incident date, `resolve_after`, `refund_after`, credit, premium, and two status URLs.
 
-The policy is active from purchase until it is resolved or refunded. When it becomes resolvable, the contract reads both public status pages and checks whether they show a relevant outage for the named service on the specified incident date.
+`resolve_after` is the first day consensus may adjudicate. `refund_after` is the next UTC day. `timeout_refund` is not callable on the day resolution first opens.
 
 ## How it works
 
-1. A customer calls buy_cover with payment attached.
-2. The contract validates dates, credit, provider identity, and source URLs.
-3. The policy is stored as ACTIVE with funds marked as RESERVED.
-4. When resolve_after is reached, resolve(policy_id) evaluates the claim.
-5. The contract uses a nondeterministic adjudication flow to compare the verdict against the two status sources.
-6. The result can be:
-   - YES: the outage is confirmed, and the customer receives the configured credit
-   - NO: no qualifying outage is found, and the provider keeps the premium
-   - UNKNOWN or DISAGREE: the outcome is inconclusive, and the policy remains active without paying or keeping funds
-7. If the policy is still unresolved after resolve_after, timeout_refund(policy_id) returns the premium to the customer.
+1. The customer calls `buy_cover` with the monthly premium attached.
+2. Dates are checked as real calendar dates, then ordered.
+3. The policy is stored `ACTIVE` with the premium `RESERVED`.
+4. On or after `resolve_after`, anyone may call `resolve(policy_id)`.
+5. Both pages are read. A stable verdict is `YES`, `NO`, `UNKNOWN`, or `DISAGREE`.
+6. Outcomes:
+   - `YES`: customer receives the credit. Any leftover premium goes to the provider.
+   - `NO`: provider keeps the premium.
+   - `UNKNOWN` or `DISAGREE`: policy stays `ACTIVE`. Funds stay reserved.
+7. On or after `refund_after`, if the policy is still `ACTIVE`, anyone may call `timeout_refund(policy_id)`. The premium returns to the customer once.
 
-## Important validation rules
+## Validation
 
-- customer and provider must be different addresses
-- premium must be greater than zero
-- credit must be greater than zero and cannot exceed the premium
-- incident_date must fall inside the covered period
-- resolve_after must be on or after incident_date
-- status_url_a and status_url_b must be HTTPS and must come from different hosts
-- source hosts are restricted to a known allowlist of public service status pages
+- `period_start`, `period_end`, `incident_date`, and `resolve_after` must be real `YYYY-MM-DD` dates before they are compared. `2026-02-31` is rejected.
+- `period_end` is on or after `period_start`.
+- `incident_date` falls inside the covered period.
+- `resolve_after` is on or after `incident_date`.
+- `refund_after` is `resolve_after` plus one UTC day. It is stored, not supplied.
+- Customer and provider are different addresses.
+- Premium is greater than zero. Credit is greater than zero and not above the premium.
+- Both status URLs are HTTPS, on the allowlist, and on different hosts.
 
-## Policy data and views
+## Views
 
-Each policy stores:
+- `get_policy(policy_id)` includes `resolve_after` and `refund_after`
+- `get_policy_count()`
+- `get_reserved_premiums()`
+- `can_resolve(policy_id)` returns `allowed` and `timeout_refund_allowed` separately
 
-- customer and provider addresses
-- service and date range
-- premium and credit
-- status values such as ACTIVE, CREDITED, RETAINED, and REFUNDED
-- verdict values such as YES, NO, UNKNOWN, DISAGREE, and TIMEOUT
-- funds_disposition showing how funds were handled
+Statuses: `ACTIVE`, `CREDITED`, `RETAINED`, `REFUNDED`.
+Verdicts: `YES`, `NO`, `UNKNOWN`, `DISAGREE`, `TIMEOUT`.
 
-The contract exposes read-only methods including:
+## Tests
 
-- get_policy(policy_id)
-- get_policy_count()
-- get_reserved_premiums()
-- can_resolve(policy_id)
+`test/direct/test_sla_outage_credit.py` covers:
 
-## Current test state
-
-The current direct tests in test/direct/test_sla_outage_credit.py verify the main behavior of the contract, including:
-
-- rejecting a customer who also sets themselves as the provider
-- requiring two distinct status sources
-- preventing a credit above the premium
-- validating that the incident date falls within the covered period
-- blocking early resolution or timeout refund before resolve_after
-- refunding the premium on timeout
-- paying the credit on a confirmed outage
-- leaving funds reserved when the adjudication verdict is UNKNOWN
+- customer cannot be the provider
+- sources must differ
+- credit cannot exceed premium
+- incident date must sit inside the period
+- impossible calendar dates are rejected
+- resolve and timeout are blocked before their dates
+- timeout is blocked on the day resolve first opens
+- timeout after `refund_after` returns the premium once
+- `UNKNOWN` does not pay or keep the premium

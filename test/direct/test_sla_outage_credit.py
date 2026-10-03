@@ -92,6 +92,37 @@ def test_incident_must_sit_in_period(direct_vm, direct_deploy, direct_alice, dir
         )
 
 
+def test_rejects_impossible_calendar_dates(direct_vm, direct_deploy, direct_alice, direct_bob):
+    contract = direct_deploy(CONTRACT)
+    direct_vm.sender = direct_alice
+    with direct_vm.expect_revert("incident_date must be a real calendar date"):
+        contract.buy_cover(
+            str(direct_bob),
+            "GitHub Actions API",
+            "2026-09-01",
+            "2026-09-30",
+            "2026-02-31",
+            "2026-12-31",
+            10**18,
+            STATUS_A,
+            STATUS_B,
+            value=10**18,
+        )
+    with direct_vm.expect_revert("period_end must be a real calendar date"):
+        contract.buy_cover(
+            str(direct_bob),
+            "GitHub Actions API",
+            "2026-09-01",
+            "2026-13-01",
+            "2026-09-15",
+            "2026-12-31",
+            10**18,
+            STATUS_A,
+            STATUS_B,
+            value=10**18,
+        )
+
+
 def test_early_resolve_and_timeout_blocked(
     direct_vm, direct_deploy, direct_alice, direct_bob
 ):
@@ -101,17 +132,45 @@ def test_early_resolve_and_timeout_blocked(
     raw = contract.get_policy(policy_id)
     assert "ACTIVE" in raw
     assert "RESERVED" in raw
+    assert "2027-01-01" in raw
 
     with direct_vm.expect_revert("policy cannot be closed before resolve_after"):
         contract.resolve(policy_id)
-    with direct_vm.expect_revert("policy cannot be closed before resolve_after"):
+    with direct_vm.expect_revert("timeout_refund cannot run before refund_after"):
         contract.timeout_refund(policy_id)
 
     after = contract.get_policy(policy_id)
     assert "ACTIVE" in after
     assert "CREDITED" not in after
     assert "REFUNDED" not in after
-    assert '"allowed": false' in contract.can_resolve(policy_id).replace(" ", "")
+    status = contract.can_resolve(policy_id).replace(" ", "")
+    assert '"allowed":false' in status
+    assert '"timeout_refund_allowed":false' in status
+
+
+def test_refund_not_open_when_resolve_first_opens(
+    direct_vm, direct_deploy, direct_alice, direct_bob
+):
+    contract = direct_deploy(CONTRACT)
+    direct_vm.sender = direct_alice
+    policy_id = contract.buy_cover(
+        str(direct_bob),
+        "GitHub Actions API",
+        "2026-10-01",
+        "2026-10-31",
+        "2026-10-03",
+        "2026-10-03",
+        10**18,
+        STATUS_A,
+        STATUS_B,
+        value=10**18,
+    )
+    raw = contract.get_policy(policy_id)
+    assert "2026-10-03" in raw
+    assert "2026-10-04" in raw
+    with direct_vm.expect_revert("timeout_refund cannot run before refund_after"):
+        contract.timeout_refund(policy_id)
+    assert "ACTIVE" in contract.get_policy(policy_id)
 
 
 def test_timeout_refunds_premium_once(
@@ -121,6 +180,8 @@ def test_timeout_refunds_premium_once(
     policy_id = _buy(
         contract, direct_vm, direct_alice, direct_bob, resolve_after="2020-01-01"
     )
+    raw = contract.get_policy(policy_id)
+    assert "2020-01-02" in raw
     contract.timeout_refund(policy_id)
 
     after = contract.get_policy(policy_id)

@@ -1,18 +1,17 @@
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
 
 import json
-import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 from genlayer import *
 
 
-DATE_RE = r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
 HTTPS = "https://"
 MAX_PAGE_CHARS = 12000
 MIN_TEXT_CHARS = 12
+REFUND_GRACE_DAYS = 1
 ZERO = Address("0x0000000000000000000000000000000000000000")
 
 ALLOWED_HOSTS = (
@@ -35,7 +34,6 @@ ALLOWED_HOSTS = (
     "status.gitlab.com",
     "status.heroku.com",
     "status.vercel.com",
-    "www.githubstatus.com",
     "status.slack.com",
     "status.twilio.com",
     "status.sendgrid.com",
@@ -90,14 +88,38 @@ def _require_https_url(url: str, label: str) -> str:
     return cleaned
 
 
+def _require_date(value: str, label: str) -> str:
+    cleaned = value.strip()
+    try:
+        datetime.strptime(cleaned, "%Y-%m-%d")
+    except ValueError:
+        raise gl.vm.UserError(label + " must be a real calendar date YYYY-MM-DD")
+    return cleaned
+
+
+def _add_days(day: str, days: int) -> str:
+    return (datetime.strptime(day, "%Y-%m-%d") + timedelta(days=days)).strftime("%Y-%m-%d")
+
+
 def _today_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+@gl.evm.contract_interface
+class _Wallet:
+    class View:
+        pass
+
+    class Write:
+        pass
 
 
 def _pay(to: Address, amount: u256) -> None:
     if amount == 0:
         return
-    gl.get_contract_at(to).emit_transfer(value=amount, on="finalized")
+    if to == ZERO:
+        raise gl.vm.UserError("cannot pay the zero address")
+    _Wallet(to).emit_transfer(value=amount)
 
 
 @allow_storage
@@ -110,6 +132,7 @@ class Policy:
     period_end: str
     incident_date: str
     resolve_after: str
+    refund_after: str
     status_url_a: str
     status_url_b: str
     premium: u256
@@ -142,6 +165,13 @@ class SlaOutageCredit(gl.Contract):
         if today < policy.resolve_after:
             raise gl.vm.UserError(
                 "policy cannot be closed before resolve_after " + policy.resolve_after
+            )
+
+    def _ensure_refundable(self, policy: Policy) -> None:
+        today = _today_utc()
+        if today < policy.refund_after:
+            raise gl.vm.UserError(
+                "timeout_refund cannot run before refund_after " + policy.refund_after
             )
 
     def _extract_page(
@@ -288,20 +318,17 @@ Rules:
     ) -> str:
         if len(service.strip()) < MIN_TEXT_CHARS:
             raise gl.vm.UserError("service name is too short")
-        for label, value in (
-            ("period_start", period_start),
-            ("period_end", period_end),
-            ("incident_date", incident_date),
-            ("resolve_after", resolve_after),
-        ):
-            if re.match(DATE_RE, value.strip()) is None:
-                raise gl.vm.UserError(label + " must be YYYY-MM-DD")
-        if period_end.strip() < period_start.strip():
+        period_start = _require_date(period_start, "period_start")
+        period_end = _require_date(period_end, "period_end")
+        incident_date = _require_date(incident_date, "incident_date")
+        resolve_after = _require_date(resolve_after, "resolve_after")
+        if period_end < period_start:
             raise gl.vm.UserError("period_end must be on or after period_start")
-        if incident_date.strip() < period_start.strip() or incident_date.strip() > period_end.strip():
+        if incident_date < period_start or incident_date > period_end:
             raise gl.vm.UserError("incident_date must fall inside the covered period")
-        if resolve_after.strip() < incident_date.strip():
+        if resolve_after < incident_date:
             raise gl.vm.UserError("resolve_after must be on or after incident_date")
+        refund_after = _add_days(resolve_after, REFUND_GRACE_DAYS)
 
         provider_addr = Address(provider)
         if provider_addr == ZERO:
@@ -325,10 +352,11 @@ Rules:
             customer=gl.message.sender_address,
             provider=provider_addr,
             service=service.strip(),
-            period_start=period_start.strip(),
-            period_end=period_end.strip(),
-            incident_date=incident_date.strip(),
-            resolve_after=resolve_after.strip(),
+            period_start=period_start,
+            period_end=period_end,
+            incident_date=incident_date,
+            resolve_after=resolve_after,
+            refund_after=refund_after,
             status_url_a=url_a,
             status_url_b=url_b,
             premium=premium,
@@ -383,7 +411,7 @@ Rules:
         policy = self._get(policy_id)
         if policy.status != "ACTIVE":
             raise gl.vm.UserError("only an active policy can be timeout-refunded")
-        self._ensure_resolvable(policy)
+        self._ensure_refundable(policy)
         premium = policy.premium
         customer = policy.customer
         policy.status = "REFUNDED"
@@ -398,15 +426,16 @@ Rules:
     def can_resolve(self, policy_id: str) -> str:
         policy = self._get(policy_id)
         today = _today_utc()
-        allowed = policy.status == "ACTIVE" and today >= policy.resolve_after
+        active = policy.status == "ACTIVE"
         return json.dumps(
             {
                 "status": policy.status,
                 "incident_date": policy.incident_date,
                 "resolve_after": policy.resolve_after,
+                "refund_after": policy.refund_after,
                 "now_utc": today,
-                "allowed": allowed,
-                "timeout_refund_allowed": allowed,
+                "allowed": active and today >= policy.resolve_after,
+                "timeout_refund_allowed": active and today >= policy.refund_after,
             },
             sort_keys=True,
         )
@@ -423,6 +452,7 @@ Rules:
                 "period_end": policy.period_end,
                 "incident_date": policy.incident_date,
                 "resolve_after": policy.resolve_after,
+                "refund_after": policy.refund_after,
                 "status_url_a": policy.status_url_a,
                 "status_url_b": policy.status_url_b,
                 "premium": str(int(policy.premium)),
